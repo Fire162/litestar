@@ -6,6 +6,18 @@
 .. changelog:: 3.0.0
     :date: 2364-01-27
 
+    .. change:: Correct OpenTelemetry ``http.route`` attribute and span name
+        :type: bugfix
+        :issue: 5120
+        :breaking:
+
+        OpenTelemetry server spans and metrics now set ``http.route`` to the matched
+        route template without the HTTP method prefix, conforming to OpenTelemetry HTTP
+        semantic conventions. Unmatched requests (404/405) no longer set ``http.route``,
+        and fall back to the HTTP method for span naming. Added
+        :func:`~litestar.plugins.opentelemetry.get_route_template` helper to resolve route
+        templates from ASGI scopes.
+
     .. change:: Remove support for implicitly declared request parameters
         :type: feature
         :breaking:

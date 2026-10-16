@@ -12,7 +12,7 @@ from litestar._asgi.routing_trie.mapping import add_route_to_trie
 from litestar._asgi.routing_trie.traversal import parse_path_to_route
 from litestar._asgi.routing_trie.types import create_node
 from litestar._asgi.utils import get_route_handlers, is_valid_host
-from litestar.exceptions import ClientException, ImproperlyConfiguredException
+from litestar.exceptions import ClientException, HTTPException, ImproperlyConfiguredException
 from litestar.utils import normalize_path
 from litestar.utils.scope.state import ScopeState
 
@@ -82,6 +82,37 @@ class ASGIRouter:
         self.route_handler_index: dict[str, RouteHandlerType] = {}
         self.route_mapping: dict[str, list[BaseRoute]] = defaultdict(list)
 
+    @staticmethod
+    def resolve_path_from_scope(scope: Scope) -> str:
+        """Resolve and normalize the path from an ASGI scope, stripping root_path if present.
+
+        Args:
+            scope: The ASGI scope instance.
+
+        Returns:
+            Normalized path string.
+        """
+        path = scope.get("path", "")
+        if root_path := scope.get("root_path", ""):
+            path = path.split(root_path, maxsplit=1)[-1]
+        return normalize_path(path)
+
+    def resolve_route_template_from_scope(self, scope: Scope) -> str | None:
+        """Attempt to resolve the route template for an ASGI scope without executing routing side-effects.
+
+        Args:
+            scope: The ASGI scope instance.
+
+        Returns:
+            The matched route template or None if no route matched.
+        """
+        try:
+            normalized_path = self.resolve_path_from_scope(scope)
+            *_, template = self.handle_routing(path=normalized_path, method=scope.get("method"))
+            return template
+        except (HTTPException, KeyError):
+            return None
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """ASGI callable.
 
@@ -89,10 +120,7 @@ class ASGIRouter:
         """
         scope.setdefault("path_params", {})
 
-        path = scope["path"]
-        if root_path := scope.get("root_path", ""):
-            path = path.split(root_path, maxsplit=1)[-1]
-        normalized_path = normalize_path(path)
+        normalized_path = self.resolve_path_from_scope(scope)
 
         try:
             try:

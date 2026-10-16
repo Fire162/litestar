@@ -2,7 +2,10 @@ from typing import TYPE_CHECKING, Any
 
 from litestar.exceptions import MissingDependencyException
 
-__all__ = ("get_route_details_from_scope",)
+__all__ = (
+    "get_route_details_from_scope",
+    "get_route_template",
+)
 
 
 try:
@@ -16,6 +19,25 @@ if TYPE_CHECKING:
     from litestar.types import Scope
 
 
+def get_route_template(scope: "Scope") -> "str | None":
+    """Retrieve the matched route template from an ASGI scope.
+
+    Args:
+        scope: The ASGI scope instance.
+
+    Returns:
+        The matched route template string, or None if no route matched.
+    """
+    if (template := scope.get("path_template")) is not None:
+        return template
+
+    litestar_app = scope.get("litestar_app") or scope.get("app")
+    if litestar_app is not None and hasattr(litestar_app, "asgi_router"):
+        return litestar_app.asgi_router.resolve_route_template_from_scope(scope)  # type: ignore[no-any-return]
+
+    return None
+
+
 def get_route_details_from_scope(scope: "Scope") -> "tuple[str, dict[Any, str]]":
     """Retrieve the span name and attributes from the ASGI scope.
 
@@ -25,11 +47,12 @@ def get_route_details_from_scope(scope: "Scope") -> "tuple[str, dict[Any, str]]"
     Returns:
         A tuple of the span name and a dict of attrs.
     """
-
-    path = scope.get("path", "").strip()
     method = str(scope.get("method", "")).strip()
+    template = get_route_template(scope)
 
-    if method and path:  # http
-        return f"{method} {path}", {HTTP_ROUTE: f"{method} {path}"}
+    if template is not None:
+        span_name = f"{method} {template}" if method else template
+        return span_name, {HTTP_ROUTE: template}
 
-    return path, {HTTP_ROUTE: path}  # websocket
+    span_name = method or scope.get("path", "").strip() or "websocket"
+    return span_name, {}

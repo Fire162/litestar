@@ -297,3 +297,41 @@ def test_routing_cache_does_not_prevent_garbage_collection() -> None:
     app_id = make_app_and_request()
     gc.collect()
     assert not any(id(obj) == app_id for obj in gc.get_objects() if type(obj) is Litestar)
+
+
+def test_resolve_path_from_scope() -> None:
+    # Path without root_path
+    assert ASGIRouter.resolve_path_from_scope({"path": "/foo/bar"}) == "/foo/bar"
+    assert ASGIRouter.resolve_path_from_scope({"path": "/foo/bar/"}) == "/foo/bar"
+
+    # Path with root_path
+    assert ASGIRouter.resolve_path_from_scope({"path": "/prefix/foo/bar", "root_path": "/prefix"}) == "/foo/bar"
+
+    # Missing or empty path
+    assert ASGIRouter.resolve_path_from_scope({}) == "/"
+
+
+def test_resolve_route_template_from_scope() -> None:
+    from litestar.params import FromPath
+
+    @get("/items/{item_id:int}", sync_to_thread=False)
+    def handler(item_id: FromPath[int]) -> dict[str, int]:
+        return {"item_id": item_id}
+
+    app = Litestar(route_handlers=[handler])
+
+    # Matched route
+    scope = {"type": "http", "method": "GET", "path": "/items/42"}
+    assert app.asgi_router.resolve_route_template_from_scope(scope) == "/items/{item_id}"
+
+    # Matched route under root_path
+    scope_root = {"type": "http", "method": "GET", "path": "/v1/items/42", "root_path": "/v1"}
+    assert app.asgi_router.resolve_route_template_from_scope(scope_root) == "/items/{item_id}"
+
+    # Unmatched route (404)
+    scope_404 = {"type": "http", "method": "GET", "path": "/not-found"}
+    assert app.asgi_router.resolve_route_template_from_scope(scope_404) is None
+
+    # Method not allowed (405)
+    scope_405 = {"type": "http", "method": "POST", "path": "/items/42"}
+    assert app.asgi_router.resolve_route_template_from_scope(scope_405) is None

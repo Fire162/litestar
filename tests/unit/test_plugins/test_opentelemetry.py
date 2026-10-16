@@ -22,7 +22,8 @@ from litestar import WebSocket, get, websocket
 from litestar.config.app import AppConfig
 from litestar.enums import ScopeType
 from litestar.exceptions import http_exceptions
-from litestar.plugins.opentelemetry import OpenTelemetryConfig, OpenTelemetryPlugin
+from litestar.params import FromPath
+from litestar.plugins.opentelemetry import OpenTelemetryConfig, OpenTelemetryPlugin, get_route_template
 from litestar.status_codes import HTTP_200_OK
 from litestar.testing import create_test_client
 from litestar.types.asgi_types import ASGIApp, Receive, Scope, Send
@@ -97,9 +98,10 @@ def test_open_telemetry_middleware_with_http_route(
             "http.user_agent": "testclient",
             "net.peer.ip": "testclient",
             "net.peer.port": 50000,
-            "http.route": "GET /",
+            "http.route": "/",
             "http.status_code": 200,
         }
+        assert third_span.name == "GET /"
 
         metric_data = reader.get_metrics_data()
         assert metric_data
@@ -186,9 +188,9 @@ def test_open_telemetry_middleware_handles_route_not_found_under_span_http(
             "http.user_agent": "testclient",
             "net.peer.ip": "testclient",
             "net.peer.port": 50000,
-            "http.route": "GET /route_that_does_not_exist",
             "http.status_code": 404,
         }
+        assert third_span.name == "GET"
 
 
 def test_open_telemetry_middleware_handles_method_not_allowed_under_span_http(
@@ -222,9 +224,9 @@ def test_open_telemetry_middleware_handles_method_not_allowed_under_span_http(
             "http.user_agent": "testclient",
             "net.peer.ip": "testclient",
             "net.peer.port": 50000,
-            "http.route": "POST /",
             "http.status_code": 405,
         }
+        assert third_span.name == "POST"
 
 
 def test_open_telemetry_middleware_handles_errors_caused_on_middleware(
@@ -270,9 +272,10 @@ def test_open_telemetry_middleware_handles_errors_caused_on_middleware(
             "http.user_agent": "testclient",
             "net.peer.ip": "testclient",
             "net.peer.port": 50000,
-            "http.route": "GET /",
+            "http.route": "/",
             "http.status_code": 401,
         }
+        assert third_span.name == "GET /"
 
 
 def test_after_exception_hook_handler_called_on_exception(
@@ -498,3 +501,147 @@ def test_tracer_config_param_accepted() -> None:
     tracer = get_tracer("test")
     config = OpenTelemetryConfig(tracer=tracer)
     assert config.tracer is tracer
+
+
+def test_open_telemetry_middleware_with_parameterized_route(
+    app_config: AppConfig,
+    exporter: InMemorySpanExporter,
+) -> None:
+    @get("/articles/{article_id:int}")
+    def handler(article_id: FromPath[int]) -> dict[str, int]:
+        return {"id": article_id}
+
+    with create_test_client(handler, middleware=app_config.middleware, plugins=app_config.plugins) as client:
+        response = client.get("/articles/9041")
+        assert response.status_code == HTTP_200_OK
+
+        _first_span, _second_span, third_span = cast("tuple[SdkSpan, SdkSpan, SdkSpan]", exporter.get_finished_spans())
+        assert third_span.name == "GET /articles/{article_id}"
+        assert third_span.attributes["http.route"] == "/articles/{article_id}"  # type: ignore[index]
+
+
+def test_open_telemetry_middleware_with_root_path(
+    app_config: AppConfig,
+    exporter: InMemorySpanExporter,
+) -> None:
+    @get("/items/{item_id:str}")
+    def handler(item_id: FromPath[str]) -> dict[str, str]:
+        return {"id": item_id}
+
+    with create_test_client(
+        handler,
+        root_path="/api/v1",
+        middleware=app_config.middleware,
+        plugins=app_config.plugins,
+    ) as client:
+        response = client.get("/api/v1/items/abc")
+        assert response.status_code == HTTP_200_OK
+
+        _first_span, _second_span, third_span = cast("tuple[SdkSpan, SdkSpan, SdkSpan]", exporter.get_finished_spans())
+        assert third_span.name == "GET /items/{item_id}"
+        assert third_span.attributes["http.route"] == "/items/{item_id}"  # type: ignore[index]
+
+
+def test_open_telemetry_metrics_with_semconv_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    resource: Resource,
+    exporter: InMemorySpanExporter,
+    request: FixtureRequest,
+) -> None:
+    from opentelemetry.instrumentation.asgi import _OpenTelemetrySemanticConventionStability
+
+    monkeypatch.setenv("OTEL_SEMCONV_STABILITY_OPT_IN", "http")
+    _OpenTelemetrySemanticConventionStability._initialized = False
+    _OpenTelemetrySemanticConventionStability._initialize()
+
+    try:
+        reader = InMemoryMetricReader()
+        meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+        tracer_provider = TracerProvider(resource=resource)
+        tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+        meter = meter_provider.get_meter(f"litestar-test-{request.node.nodeid}")
+
+        test_config = OpenTelemetryConfig(
+            tracer_provider=tracer_provider,
+            meter=meter,
+            meter_provider=meter_provider,
+        )
+
+        @get("/orders/{order_id:int}", sync_to_thread=False)
+        def handler(order_id: FromPath[int]) -> dict[str, int]:
+            return {"order_id": order_id}
+
+        with create_test_client(handler, plugins=[OpenTelemetryPlugin(test_config)]) as client:
+            response = client.get("/orders/42")
+            assert response.status_code == HTTP_200_OK
+
+            client.get("/not-found")
+
+            metric_data = reader.get_metrics_data()
+            assert metric_data
+
+            duration_routes = set()
+            for rm in metric_data.resource_metrics:
+                for sm in rm.scope_metrics:
+                    for m in sm.metrics:
+                        if m.name == "http.server.request.duration":
+                            for dp in m.data.data_points:
+                                duration_routes.add(dp.attributes.get("http.route"))
+
+            assert "/orders/{order_id}" in duration_routes
+            assert "GET /orders/42" not in duration_routes
+            assert "/orders/42" not in duration_routes
+    finally:
+        _OpenTelemetrySemanticConventionStability._initialized = False
+        _OpenTelemetrySemanticConventionStability._initialize()
+
+
+def test_get_route_template_helper() -> None:
+    from litestar import Litestar
+    from litestar.plugins.opentelemetry import get_route_details_from_scope
+
+    # 1. From scope directly
+    assert get_route_template({"path_template": "/existing/{id}"}) == "/existing/{id}"
+
+    # 2. Scope without litestar_app
+    assert get_route_template({"path": "/foo", "method": "GET"}) is None
+
+    # 3. Scope with litestar_app and matching route
+    @get("/users/{user_id:int}", sync_to_thread=False)
+    def user_handler(user_id: FromPath[int]) -> dict[str, int]:
+        return {"id": user_id}
+
+    app = Litestar(route_handlers=[user_handler])
+    scope = {"type": "http", "method": "GET", "path": "/users/123", "litestar_app": app}
+    assert get_route_template(scope) == "/users/{user_id}"
+
+    name, attrs = get_route_details_from_scope(scope)
+    assert name == "GET /users/{user_id}"
+    assert attrs == {"http.route": "/users/{user_id}"}
+
+    # 4. Scope with 404 (unmatched)
+    scope_404 = {"type": "http", "method": "GET", "path": "/not-found", "litestar_app": app}
+    assert get_route_template(scope_404) is None
+    name_404, attrs_404 = get_route_details_from_scope(scope_404)
+    assert name_404 == "GET"
+    assert attrs_404 == {}
+
+    # 5. Scope with 405 (method not allowed)
+    scope_405 = {"type": "http", "method": "POST", "path": "/users/123", "litestar_app": app}
+    assert get_route_template(scope_405) is None
+    name_405, attrs_405 = get_route_details_from_scope(scope_405)
+    assert name_405 == "POST"
+    assert attrs_405 == {}
+
+    # 6. Scope under root_path
+    scope_root = {
+        "type": "http",
+        "method": "GET",
+        "root_path": "/api",
+        "path": "/api/users/123",
+        "litestar_app": app,
+    }
+    assert get_route_template(scope_root) == "/users/{user_id}"
+    name_root, attrs_root = get_route_details_from_scope(scope_root)
+    assert name_root == "GET /users/{user_id}"
+    assert attrs_root == {"http.route": "/users/{user_id}"}
